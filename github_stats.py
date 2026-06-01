@@ -485,6 +485,9 @@ Languages:
         deletions = 0
         for repo in await self.repos:
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+            # Skip repos where the API returned an unexpected response (e.g., error dict)
+            if not isinstance(r, list):
+                continue
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
                 if not isinstance(author_obj, dict) or not isinstance(
@@ -492,7 +495,10 @@ Languages:
                 ):
                     continue
                 author = author_obj.get("author", {}).get("login", "")
-                if author != self.username:
+                # Use case-insensitive comparison since GitHub usernames are
+                # case-insensitive, but the API may return different casing
+                # than the GITHUB_ACTOR environment variable
+                if author.lower() != self.username.lower():
                     continue
 
                 for week in author_obj.get("weeks", []):
