@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+import subprocess
+import tempfile
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
@@ -74,11 +76,10 @@ class Queries(object):
         """
 
         # Use exponential backoff when the API returns 202 (still computing).
-        # Start at 2s, double each retry, cap at 60s.  With 10 retries the
-        # total wait is ~6 minutes, giving GitHub's stats cache time to
-        # generate.
+        # Start at 2s, double each retry, cap at 30s.  With 5 retries the
+        # total wait is ~1 minute, then we fall back to cloning the repo.
         backoff = 2
-        for _ in range(10):
+        for _ in range(5):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
@@ -97,7 +98,7 @@ class Queries(object):
                     # print(f"{path} returned 202. Retrying in {backoff}s...")
                     print(f"A path returned 202. Retrying in {backoff}s...")
                     await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+                    backoff = min(backoff * 2, 30)
                     continue
 
                 result = await r_async.json()
@@ -115,7 +116,7 @@ class Queries(object):
                     if r_requests.status_code == 202:
                         print(f"A path returned 202. Retrying in {backoff}s...")
                         await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 60)
+                        backoff = min(backoff * 2, 30)
                         continue
                     elif r_requests.status_code == 200:
                         return r_requests.json()
@@ -267,6 +268,7 @@ class Stats(object):
         ignore_forked_repos: bool = False,
     ):
         self.username = username
+        self.access_token = access_token
         self._ignore_forked_repos = ignore_forked_repos
         self._exclude_repos = set() if exclude_repos is None else exclude_repos
         self._exclude_langs = set() if exclude_langs is None else exclude_langs
@@ -280,6 +282,8 @@ class Stats(object):
         self._repos: Optional[Set[str]] = None
         self._lines_changed: Optional[Tuple[int, int]] = None
         self._views: Optional[int] = None
+        self._emails: Optional[List[str]] = None
+        self._git_semaphore = asyncio.Semaphore(3)
 
     async def to_str(self) -> str:
         """
@@ -481,45 +485,136 @@ Languages:
             )
         return cast(int, self._total_contributions)
 
+    async def _get_user_emails(self) -> List[str]:
+        """
+        Fetch the user's verified emails from the GitHub API.  Used to match
+        commits when falling back to local git clone for lines-changed data.
+        :return: list of verified email addresses
+        """
+        if self._emails is not None:
+            return self._emails
+        r = await self.queries.query_rest("/user/emails")
+        if isinstance(r, list):
+            self._emails = [
+                entry.get("email")
+                for entry in r
+                if entry.get("verified")
+            ]
+        else:
+            self._emails = []
+        if not self._emails:
+            # Fall back to the noreply address used by GitHub
+            self._emails = [f"{self.username}@users.noreply.github.com"]
+        return self._emails
+
+    async def _lines_changed_via_git(
+        self, repo: str, emails: List[str]
+    ) -> Tuple[int, int]:
+        """
+        Clone the repository (bare) and use ``git log --numstat`` to tally
+        lines added and deleted by the given email addresses.  This mirrors
+        the approach used by jstrieb/github-stats v2 when the REST API
+        returns 202 (accepted) for all retries.
+
+        :param repo: repository name in ``owner/name`` format
+        :param emails: list of email addresses to match against authors
+        :return: (additions, deletions) tuple
+        """
+        async with self._git_semaphore:
+            url = (
+                f"https://{self.username}:{self.access_token}"
+                f"@github.com/{repo}.git"
+            )
+            repo_dir = repo.replace("/", "_")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                clone_dir = os.path.join(tmpdir, repo_dir)
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "git", "clone", "--bare",
+                        "--filter=blob:limit=1m", "--no-tags",
+                        "--single-branch",
+                        url, clone_dir,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    code = await asyncio.wait_for(proc.wait(), timeout=120)
+                    if code != 0:
+                        print(f"git clone failed for {repo} (exit {code})")
+                        return (0, 0)
+
+                    additions = 0
+                    deletions = 0
+                    for email in emails:
+                        log_proc = await asyncio.create_subprocess_exec(
+                            "git", "-C", clone_dir,
+                            "log", "--numstat", "--pretty=tformat:",
+                            f"--author={email}",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        stdout, _ = await asyncio.wait_for(
+                            log_proc.communicate(), timeout=120
+                        )
+                        for line in stdout.decode().split("\n"):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            parts = line.split("\t")
+                            if len(parts) >= 2:
+                                try:
+                                    additions += int(parts[0])
+                                    deletions += int(parts[1])
+                                except ValueError:
+                                    pass
+                    return (additions, deletions)
+                except Exception as e:
+                    print(f"git fallback failed for {repo}: {e}")
+                    return (0, 0)
+
     @property
     async def lines_changed(self) -> Tuple[int, int]:
         """
         :return: count of total lines added, removed, or modified by the user
+
+        First tries the GitHub REST API (``/stats/contributors``).  If the
+        endpoint keeps returning 202 (accepted, still computing), falls back
+        to cloning each repository and tallying lines with ``git log
+        --numstat``, matching the approach used by jstrieb/github-stats v2.
         """
         if self._lines_changed is not None:
             return self._lines_changed
 
-        # Process all repos concurrently so that while one repo is waiting for
-        # the /stats/contributors endpoint to finish generating (HTTP 202),
-        # other repos can be processed in parallel.
         repos = await self.repos
+        emails = await self._get_user_emails()
 
         async def process_repo(repo: str) -> Tuple[int, int]:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
-            # Skip repos where the API returned an unexpected response (e.g., error dict)
-            if not isinstance(r, list):
-                return (0, 0)
-            repo_additions = 0
-            repo_deletions = 0
-            for author_obj in r:
-                # Handle malformed response from the API by skipping this author
-                if not isinstance(author_obj, dict) or not isinstance(
-                    author_obj.get("author", {}), dict
-                ):
-                    continue
-                author = author_obj.get("author", {}).get("login", "")
-                # Use case-insensitive comparison since GitHub usernames are
-                # case-insensitive, but the API may return different casing
-                # than the GITHUB_ACTOR environment variable
-                if author.lower() != self.username.lower():
-                    continue
+            r = await self.queries.query_rest(
+                f"/repos/{repo}/stats/contributors"
+            )
+            # If the API returned a valid list, parse it
+            if isinstance(r, list):
+                repo_additions = 0
+                repo_deletions = 0
+                for author_obj in r:
+                    if not isinstance(author_obj, dict) or not isinstance(
+                        author_obj.get("author", {}), dict
+                    ):
+                        continue
+                    author = author_obj.get("author", {}).get("login", "")
+                    if author.lower() != self.username.lower():
+                        continue
+                    for week in author_obj.get("weeks", []):
+                        repo_additions += week.get("a", 0)
+                        repo_deletions += week.get("d", 0)
+                if repo_additions or repo_deletions:
+                    return (repo_additions, repo_deletions)
+                # API returned an empty list or user not found — fall through
+                # to git so we don't miss repos with 0 lines reported by API
 
-                for week in author_obj.get("weeks", []):
-                    repo_additions += week.get("a", 0)
-                    repo_deletions += week.get("d", 0)
-            return (repo_additions, repo_deletions)
+            # API failed or returned no data — fall back to local git clone
+            return await self._lines_changed_via_git(repo, emails)
 
-        results = await asyncio.gather(*[process_repo(repo) for repo in repos])
+        results = await asyncio.gather(*[process_repo(r) for r in repos])
         additions = sum(r[0] for r in results)
         deletions = sum(r[1] for r in results)
 
