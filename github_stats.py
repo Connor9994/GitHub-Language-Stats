@@ -73,7 +73,12 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
+        # Use exponential backoff when the API returns 202 (still computing).
+        # Start at 2s, double each retry, cap at 60s.  With 10 retries the
+        # total wait is ~6 minutes, giving GitHub's stats cache time to
+        # generate.
+        backoff = 2
+        for _ in range(10):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
@@ -89,9 +94,10 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                 if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
+                    # print(f"{path} returned 202. Retrying in {backoff}s...")
+                    print(f"A path returned 202. Retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
                     continue
 
                 result = await r_async.json()
@@ -107,8 +113,9 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                     if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
+                        print(f"A path returned 202. Retrying in {backoff}s...")
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 60)
                         continue
                     elif r_requests.status_code == 200:
                         return r_requests.json()
@@ -481,15 +488,21 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
-        additions = 0
-        deletions = 0
-        for repo in await self.repos:
+
+        # Process all repos concurrently so that while one repo is waiting for
+        # the /stats/contributors endpoint to finish generating (HTTP 202),
+        # other repos can be processed in parallel.
+        repos = await self.repos
+
+        async def process_repo(repo: str) -> Tuple[int, int]:
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
             # Skip repos where the API returned an unexpected response (e.g., error dict)
             if not isinstance(r, list):
-                continue
+                return (0, 0)
+            repo_additions = 0
+            repo_deletions = 0
             for author_obj in r:
-                # Handle malformed response from the API by skipping this repo
+                # Handle malformed response from the API by skipping this author
                 if not isinstance(author_obj, dict) or not isinstance(
                     author_obj.get("author", {}), dict
                 ):
@@ -502,8 +515,13 @@ Languages:
                     continue
 
                 for week in author_obj.get("weeks", []):
-                    additions += week.get("a", 0)
-                    deletions += week.get("d", 0)
+                    repo_additions += week.get("a", 0)
+                    repo_deletions += week.get("d", 0)
+            return (repo_additions, repo_deletions)
+
+        results = await asyncio.gather(*[process_repo(repo) for repo in repos])
+        additions = sum(r[0] for r in results)
+        deletions = sum(r[1] for r in results)
 
         self._lines_changed = (additions, deletions)
         return self._lines_changed
